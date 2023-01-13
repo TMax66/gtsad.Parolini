@@ -1,0 +1,261 @@
+---
+title: "Toxoplasma Deer"
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+---
+
+ 
+
+```{r include=FALSE}
+ library(readxl)
+library(dplyr)
+library(gplots)
+library(ggplot2)
+library(tidyr)      
+library(scales)     
+library(ggthemes)
+library(DescTools)
+library(rstanarm)
+library(bayesplot)
+library(coda)
+library(loo)
+library(DataExplorer)
+library(emmeans)
+library(ggeffects)
+library(rethinking)
+library(tidyverse)
+library(ggridges)
+library(RColorBrewer)
+library(patchwork)
+
+df <- read_excel("df.xlsx")
+cols <- c("specie", "HEV","tgondi","governorate", "area", "sex", "age_class", "year", "sector")
+deer_b<-filter(df, specie=="DEER")
+deer_b<-select(deer_b, c("tgondi","age_class","sex","area","year"))
+deer_b<-deer_b[complete.cases(deer_b),]
+
+deer_b$tgondi<-as.numeric(as.factor(deer_b$tgondi))
+deer_b$tgondi<-ifelse(deer_b$tgondi==1, 0, deer_b$tgondi-1)
+deer_b$age_class<-as.numeric(as.factor(deer_b$age_class))
+deer_b$sex<-as.numeric(as.factor(deer_b$sex))
+deer_b$area<-as.numeric(as.factor(deer_b$area))
+deer_b$year<-as.numeric(as.factor(deer_b$year))
+
+data_list<-list(
+  tgondi=as.integer(deer_b$tgondi), 
+  age_class=as.integer(deer_b$age_class), 
+  sex=as.integer(deer_b$sex), 
+  area=as.integer(deer_b$area),
+  year=as.integer(deer_b$year)
+)
+
+```
+
+### **Specificazione del modello mediante DAG**
+
+I predittori d'interesse sono Area, Eta' e Anno. Non ci sono evidenze di un effetto del sesso sulla probabilità di infezione a toxoplasma in generale, quindi lo escludo a priori dal modello.
+
+Il predittore che mi sembra più interessante da esplorare è l'Area. 
+L'area è un proxy di differenti variabili non misurate che possono spiegare la differente prevalenza di toxoplasma. L'età la considero a priori un confondente in quanto è sicuramente associata alla sieropositività, ma anche all'area se supponiamo che nelle diverse aree il campionamento non probabilitstico comporti una selezione non bilanciata delle diverse classi di età oltre ad esserci condizioni ambientali delle diverse aree che possono condizionare le dinamiche di popolazione dei cervi e rendere più probabili la selezione di elementi di alcune classi di età piùttosto che di altre.L'anno del campionamento credo sia associato alla sieroprevalenza indirettamente. Mi pare più ragionevole pensare che nei diversi anni ci siano condizioni ambientali (area) e di dinamica di popolazione (age_class) differenti che possono spiegare la differente prevalenza osservata. In figura la differente sieroprevalenza per area e classi di età e per anno. 
+
+```{r echo=FALSE}
+area<-deer_b %>% 
+  group_by(area) %>% 
+  summarise(prev=mean(tgondi)) %>% 
+  arrange(prev) %>% 
+  mutate(area=factor(area,unique(area))) %>%
+  ggplot(aes(x=area, y=prev))+geom_bar(stat = "identity", width = 0.3, fill="firebrick4")+
+  coord_flip()
+
+age<-deer_b %>% 
+  group_by(age_class) %>% 
+  summarise(prev=mean(tgondi)) %>% 
+  arrange(prev) %>% 
+  mutate(age_class=factor(age_class,unique(age_class))) %>%
+  ggplot(aes(x=age_class, y=prev))+geom_bar(stat = "identity", width = 0.3, fill="firebrick4")+
+  coord_flip()
+
+anno<-deer_b %>% 
+  group_by(year) %>% 
+  summarise(prev=mean(tgondi)) %>% 
+  arrange(prev) %>% 
+  mutate(year=factor(year,unique(year))) %>%
+  ggplot(aes(x=year, y=prev))+geom_bar(stat = "identity", width = 0.3, fill="firebrick4")+
+  coord_flip()
+
+
+
+area+age+anno
+```
+
+Il modello quindi più adeguato a spiegare la variabilità della sieroprevalenza di Toxoplasma gondii nella popolazione di cervi è quello descritto dal DAG:
+
+```{r echo=FALSE,fig.height = 3, fig.width = 3, fig.align = "center"}
+library(dagitty)
+
+Toxo<-dagitty( "dag{ 
+            Area<-Year->Age
+             Area->Age
+             Area->T<-Age
+                     }")
+
+
+plot(graphLayout(Toxo))
+```
+
+Da questo modello risulta che l'anno è indipendente dalla sieroprevalenza condizionalmente all'età e all'area. 
+
+### **Selezione del modello**
+
+Il modello che deriva dalla considerazioni di sopra sarà quindi:
+
+ Toxo~$Bernoulli(p_{i})$
+ 
+ $logit(p_{i})=\alpha+ \beta1_{Area} + \beta2_{Ageclass} + \beta3_{Year}$
+ 
+ $\alpha$~Normal(0,?)
+ 
+ $\beta1$~Normal(0,?)
+ 
+ $\beta2$~Normal(0,?)
+ 
+ $\beta3$~Normal(0,?)
+
+**Prior predictive check**
+
+Inizio a considerare solo il modello nullo per studiare se la prior scelta è ragionevole, utilizzo differenti priors: 
+
+* norm(0,1)
+* norm(0,5)
+* norm(0,2.5)
+* norm(0,1.5)
+
+
+adatto il modello 
+```m0<-ulam(
+  alist(
+    tgondi~dbinom(1,p),
+    logit(p)<-a,
+    a~dnorm(0,1)), 
+  data=data_list,control=list(adapt_delta=0.99), 
+  iter = 20000,  chains=4,log_lik=TRUE)
+```
+e quindi estraggo le prior
+
+``` 
+set.seed(999)
+prior<-extract.prior(m0)
+prior$a<-inv_logit(prior$a)
+
+```
+e ripeto per le altre priors poi  dopo trasformazione in scala di probabilità derivo le curva di densità
+
+```{r echo=FALSE,fig.align = "center",out.width = '60%'}
+
+knitr::include_graphics("priors.png")
+```
+
+Le prime due ipotesi di prior danno troppo peso a risultati estremi, cioè il modello prima di vedere i dati pensa, sulla base delle priors, che i cervi o hanno una sieroprevaenza prossima a 0 o prossima a 100%. La quarta ipotesi norm(0,1) prevede che la siero prevalenza sia concentrata prevalentemente tra 0.4 e 0.7 (più o meno), mentre meno probabili sono valori più bassi o più alti. Infine la terza ipotesi ha una distribuzione più flat senza essere equiparabile a una distribuzione uniforme totalemente non informativa. In questo caso attribuisce una certa equiprobabilità ad un un range più ampio della prior norm(0,1) che a mio parere è più ragionevole.
+
+A questo punto passo a valutare le priors relative al predittore d'interesse e cioè l'area in particolare la prior deve cogliere in modo plausibile le differenze tra le diverse categorie del predittore, è sufficiente studiare il comportamento della prior del coefficiente per il contrasto tra due categorie.
+
+Quindi procedo con l'adattare il modello con l'aggiunta del predittore Area
+``` 
+m1.1<-ulam(
+  alist(
+    tgondi~dbinom(1,p),
+    logit(p)<-a+b*area,
+    a~dnorm(0,2.5)), 
+    b~dnorm(0,1)
+  data=data_list,control=list(adapt_delta=0.99), 
+  iter = 20000,  chains=4,log_lik=TRUE)
+
+```
+Estraggo le prior e trasformo le stime dei coefficienti del predittore con la funzione inv_logit ottenendo la media della sieroprevalenza nelle diverse categorie del predittore Area
+
+```
+set.seed(999)
+prior4<-extract.prior(m1.1)
+
+p<-sapply(1:4, function(k) inv_logit(prior4$a+prior4$b[,k]))
+
+```
+Ora calcolo la differenza tra il primo e il secondo livello e faccio il grafico di densità
+
+```
+dens(abs(p[,1]-p[,2]), adj=0.1)
+
+```
+ripeto la procedura per due ipotesi di priors:
+
+*norm(0,1)
+*norm(0,1.5)
+*norm(0,2.5)
+
+```{r echo=FALSE,fig.align = "center",out.width = '60%'}
+
+knitr::include_graphics("priors2.png")
+```
+
+La prima ipotesi implica che in media il modello crede che la differenza in sieroprevalenza tre le diverse aree sia dell'ordine del 17%, la seconda ipotesi
+del 25% e infine la terza circa il 30%. E' difficile immaginare quale possa essere una differenza di sieroprevalenza tra le aree indagate. Tutte le prior sembrano adeguate a dare poco peso a differenze estreme concentrandosi prevalentemente su differenze intorno allo zero, con una distribuzione fortemente asimmetrica. Per quanto si tratti di aree geograficamente separate non credo possano essere considerati compartimenti stagni. Sono aree alpine quindi condividono caratteristiche orgrafiche e ambientali tra di loro. Inoltre non è plausibile pensare che le popolazioni di cervi siano cosi settorializzate da rappresentare popolazioni isolate. Il toxoplasma come parassita ha un ciclo oro-fecale che è comune a diverse specie quindi, ospiti diversi dal cervo che passano da un'area all'altra ed eliminano oocisti, possono contribuire efficacemente alla contaminazione ambientale di diverse areali. Queste considerazioni mi portano a pensare che sono poco probabili differenze estreme tra le diverse aree della sieroprevalenza. Considerando la sovrapposizione delle diverse prior nel modelli che seguono userò l'ipotesi intermedia norm(0, 1.5)
+
+
+### **Model selection**
+
+La variabile Area è costituita da 4 livelli che esauriscono i livelli d'interesse. Quindi non rappresentano un campione casuale della variabile "area". Da questo punto di vista non avrebbe senso usarla come variabile random secondo un'approccio non bayesiano. In questo caso la correlazione delle osservazioni intra-valle sarebbe assorbita dall'effetto fisso con una contrazione degli errori standard. In un contesto bayesiano però utilizzare la variabile area come effetto random consentirebbe di ridurre il rischio di overfitting attraverso l'uso di priors adattative che regolarizzano le stime. Inoltre come sottolinea McElreath è sbagliato pensare che siccome una variabile è "fixed" [by the experiment.... i situazioni sperimentali classicamente il trattamento è una variabile fissa per definizione e non può variare....] allora va trattata solo come effetto fisso. La ragione per cui vanno usati  i "varying effects" è perchè forniscono una migliore inferenza.
+E comunque quando una varibile (fixed) ha pochi livelli e molti dati in ogni livello in genere il pooling (cioè trattarla come variabile random-effects non fa differenza). Se sono poche le osservazioni intra-livello allora il pooling può aiutare.
+
+Prenderò in considerazione i seguenti modelli:
+
+* full model (senza varying effects)
+ 
+ $logit(p_{i})=\alpha+ \beta1_{Area} + \beta2_{Ageclass} + \beta3_{Year}$
+
+* multilevel model con area come varying effects
+
+ $logit(p_{i})=\alpha_{Area}+ \beta2_{Ageclass} + \beta3_{Year}$
+ 
+* multilevel model con area e anno come varying effects
+
+ $logit(p_{i})=\alpha_{Area}+ \gamma_{Year} + \beta2_{Ageclass}$
+ 
+ Quindi usando le metriche WAIC e PSIS confronto i 3 modelli 
+ 
+<table border=1>
+<tr> <th>  </th> <th> WAIC </th> <th> SE </th> <th> dWAIC </th> <th> dSE </th> <th> pWAIC </th> <th> weight </th>  </tr>
+  <tr> <td align="right"> M3 </td> <td align="right"> 88.36 </td> <td align="right"> 9.36 </td> <td align="right"> 0.00 </td> <td align="right">  </td> <td align="right"> 4.19 </td> <td align="right"> 0.71 </td> </tr>
+  <tr> <td align="right"> M2 </td> <td align="right"> 91.51 </td> <td align="right"> 10.25 </td> <td align="right"> 3.15 </td> <td align="right"> 2.29 </td> <td align="right"> 6.54 </td> <td align="right"> 0.15 </td> </tr>
+  <tr> <td align="right"> M1 </td> <td align="right"> 91.52 </td> <td align="right"> 10.20 </td> <td align="right"> 3.16 </td> <td align="right"> 2.17 </td> <td align="right"> 6.53 </td> <td align="right"> 0.15 </td> </tr>
+   </table>
+
+
+M1 e M2, sono praticamente identici. Aggiungere al modello l'area come varying effect non migliora in termini di accuratezza/predizione.
+Se invece si tratta la variabile anno come varying effect il modello migliora e concentra il 70% del peso ....( cosa cazzo vuol dire ancora non l'ho chiaro... ma più è verso uno meglio è). 
+Come suggerisce McElerath, i modelli non dovrebbero essere scelti solo sui valori dei Criteri d'Informazione (WAIC e PSIS), perchè modelli più accurati dal punto di vista predittivo potrebbero non essere validi sul piano causale.  Rispetto alla specificazione del modello sopra indicata il modello M2 e M3 si caratterizzano per il fatto di essere multilevel, la struttura causale non cambia nella sostanza. Questo vale anche per il modello M3, in cui l'effetto fisso Anno non è presente in quanto il contributo della variabile Anno è nella parte "random" del modello. Non cambia perchè come visto prima il modello causale specifica che la variabile anno è indipendente dall'outcome condizionalmente a Area e Età. Credo che voglia dire che se utilizzo come predittore solo l'anno e non aggiusto ( cioè non condiziono) per Area e Età potrei osservare un associazione anno-outcome che è spuria. Quindi non controllare per anno non è un problema in quanto l'effetto dell'anno è compreso in Area e Età. Per questo motivo M3 mantiene lo stesso significato causale del modello descritto dal DAG con un maggior controllo della variabilità controllando oltre che per la cluster Area anche il cluster ( o blocco) Anno di osservazione. M3 però non utilizza l'area come effetto fisso quindi per poter mantenere la struttura causale del DAG considerando il fatto che è l'unica variabile epidemiologicamente importante sono portato a selezionare un modello con solo l'anno come varying effects.
+
+* multilevel model anno come varying effects
+
+ $logit(p_{i})= \alpha_{Year}+\beta1_{Area}+\beta2_{Ageclass}$
+
+Il confronto tra i 4 modelli ora diventa
+
+<table border=1>
+<tr> <th>  </th> <th> WAIC </th> <th> SE </th> <th> dWAIC </th> <th> dSE </th> <th> pWAIC </th> <th> weight </th>  </tr>
+  <tr> <td align="right"> M3 </td> <td align="right"> 88.36 </td> <td align="right"> 9.36 </td> <td align="right"> 0.00 </td> <td align="right">  </td> <td align="right"> 4.19 </td> <td align="right"> 0.52 </td> </tr>
+  <tr> <td align="right"> M4 </td> <td align="right"> 89.75 </td> <td align="right"> 9.72 </td> <td align="right"> 1.39 </td> <td align="right"> 1.58 </td> <td align="right"> 5.53 </td> <td align="right"> 0.26 </td> </tr>
+  <tr> <td align="right"> M2 </td> <td align="right"> 91.51 </td> <td align="right"> 10.25 </td> <td align="right"> 3.15 </td> <td align="right"> 2.29 </td> <td align="right"> 6.54 </td> <td align="right"> 0.11 </td> </tr>
+  <tr> <td align="right"> M1 </td> <td align="right"> 91.52 </td> <td align="right"> 10.20 </td> <td align="right"> 3.16 </td> <td align="right"> 2.17 </td> <td align="right"> 6.53 </td> <td align="right"> 0.11 </td> </tr>
+   </table>
+
+
+M3 è ancora il migliore ma non c'è tantissima differenza con M4 che però è più coerente con la specificazione causale. Quindi userei questo modello.
+
+### **Modello M4**
+....to be continued.
+
+ 
+ 
+ 
